@@ -1,18 +1,16 @@
 package org.apache.spark.ml.made
 
-import breeze.linalg.*
 import breeze.stats.distributions.Gaussian
 import org.apache.log4j.Logger
 import org.apache.spark.ml.linalg.{DenseVector, Vector, VectorUDT, Vectors}
 import org.apache.spark.ml.param.ParamMap
 import org.apache.spark.ml.param.shared.{HasInputCol, HasLabelCol, HasOutputCol}
-import org.apache.spark.ml.util.{DefaultParamsReadable, DefaultParamsReader, DefaultParamsWritable, DefaultParamsWriter, Identifiable, MLReadable, MLReader, MLWritable, MLWriter, SchemaUtils}
+import org.apache.spark.ml.util.{DefaultParamsReader, DefaultParamsWriter, Identifiable, MLReadable, MLReader, MLWritable, MLWriter, SchemaUtils}
 import org.apache.spark.ml.{Estimator, Model}
 import org.apache.spark.mllib
 import org.apache.spark.mllib.stat.MultivariateOnlineSummarizer
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
-import org.apache.spark.sql.functions.avg
-import org.apache.spark.sql.{DataFrame, Dataset, Encoder, SparkSession}
+import org.apache.spark.sql.{DataFrame, Dataset, Encoder, Row}
 import org.apache.spark.sql.types.StructType
 
 import scala.util.control.Breaks.{break, breakable}
@@ -29,7 +27,6 @@ trait LinearRegressionParams extends HasInputCol with HasOutputCol with HasLabel
 
   protected def validateAndTransformSchema(schema: StructType): StructType = {
     SchemaUtils.checkColumnType(schema, getInputCol, new VectorUDT())
-    //    SchemaUtils.checkColumnType(schema, getLabelCol, DoubleType)
 
     if (schema.fieldNames.contains($(outputCol))) {
       SchemaUtils.checkColumnType(schema, getOutputCol, new VectorUDT())
@@ -43,21 +40,22 @@ trait LinearRegressionParams extends HasInputCol with HasOutputCol with HasLabel
 /**
  * Эстиматор линейной регрессии
  *
- * @param uid строка с уникальным идентификатором
+ * @param uid     строка с уникальным идентификатором
+ * @param epsilon точность для остановки обучения
+ * @param maxIter максимальное количество итераций
+ * @param lr      регулятор шага градиентного спуска. потом нормируется на длину вектора градиента.
+ *
  */
-class LinearRegression(override val uid: String) extends Estimator[LinearRegressionModel]
-  with LinearRegressionParams with DefaultParamsWritable {
-  /** Точность для остановки обучения */
-  val epsilon = 1e-9
-  /** Максимальное количество итераций */
-  val MAX_ITER = 10000
-  /** регулятор шага градиентного спуска. потом нормируется на длину вектора градиента. */
-  val lambda = 0.5
-
-  def this() = this(Identifiable.randomUID("linearRegression"))
+class LinearRegression(override val uid: String,
+                       val epsilon: Double,
+                       val maxIter: Int,
+                       val lr: Double) extends Estimator[LinearRegressionModel]
+  with LinearRegressionParams with MLWritable {
+  def this(epsilon: Double, maxIter: Int, lr: Double) = this(Identifiable.randomUID("linearRegression"), epsilon, maxIter, lr)
 
   /** обучение модели */
   override def fit(dataset: Dataset[_]): LinearRegressionModel = {
+    implicit val encoder: Encoder[Vector] = ExpressionEncoder()
     val logger = Logger.getLogger("LR.fit")
 
     val normal01: Gaussian = breeze.stats.distributions.Gaussian(0, 1)
@@ -66,37 +64,35 @@ class LinearRegression(override val uid: String) extends Estimator[LinearRegress
 
     var w = Vectors.fromBreeze(breeze.linalg.DenseVector.rand(size, normal01)).toDense
     var b: Double = normal01.get()
-    import dataset.sqlContext.implicits._
+    val vectors: DataFrame = dataset.toDF()
     breakable {
-      for (i <- 0 to MAX_ITER) {
+      for (i <- 0 to maxIter) {
         val model = new LinearRegressionModel(w, b).setInputCol($(inputCol)).setOutputCol("calc")
-        val y = model.transform(dataset)
-        val epsDf = y.withColumn("eps", $"calc" - $"y").cache()
+        val summary = vectors.rdd.mapPartitions((data: Iterator[Row]) => {
+          val summarizer1 = new MultivariateOnlineSummarizer()
+          val summarizer2 = new MultivariateOnlineSummarizer()
+          data.foreach(v => {
+            val vB: breeze.linalg.Vector[Double] = v.getAs[DenseVector](0).asBreeze
+            val y: Double = v.getAs[Double](1)
+            val calc = model.calcOne(vB)
+            val eps = calc - y
+            val grad = vB * eps
+            summarizer1.add(mllib.linalg.Vectors.dense(eps))
+            summarizer2.add(mllib.linalg.Vectors.fromBreeze(grad))
+          })
+          Iterator(Tuple2(summarizer1, summarizer2))
+        }).reduce((t1, t2) => (t1._1 merge t2._1, t1._2 merge t2._2))
+        val eps = summary._1.mean.asML(0)
+        val rGradMean = summary._2.mean.asML
 
-        val multUdf = epsDf.sqlContext.udf.register(uid + "_grad", (x: Vector, eps: Double) => Vectors.fromBreeze(x.asBreeze * eps))
-        val gradDf = epsDf.withColumn("grad", multUdf(epsDf("features"), epsDf("eps"))).cache()
-
-        implicit val encoder: Encoder[Vector] = ExpressionEncoder()
-        val vectors: Dataset[Vector] = gradDf.select(gradDf("grad").as[Vector])
-        val summary = vectors.rdd.mapPartitions((data: Iterator[Vector]) => {
-          val summarizer = new MultivariateOnlineSummarizer()
-          data.foreach(v => summarizer.add(mllib.linalg.Vectors.fromBreeze(v.asBreeze)))
-          Iterator(summarizer)
-        }).reduce(_ merge _)
-        val rGradMean: Vector = summary.mean.asML
-        //        val Row(Row(rGradMean)) = gradDf
-        //          .select(Summarizer.metrics("mean").summary(gradDf("grad")))
-        //          .first()
-
-        val eps: Double = gradDf.agg(avg($"eps")).first()(0).asInstanceOf[Double]
-        if (math.abs(eps) <= epsilon)
-          break
         val grad = rGradMean.asInstanceOf[Vector].toDense
         val gradBreeze = grad.asBreeze
-        var gradBreeze2 = gradBreeze.t * gradBreeze
+        var gradBreeze2: Double = gradBreeze.t * gradBreeze
+        if (math.abs(gradBreeze2) <= epsilon)
+          break
         if (gradBreeze2 <= 1)
           gradBreeze2 = 1.0
-        val l = lambda / math.sqrt(gradBreeze2)
+        val l = lr / math.sqrt(gradBreeze2)
         w = Vectors.fromBreeze(w.asBreeze - gradBreeze * l).toDense
         b = b - l * eps
         if (i % 10 == 0) {
@@ -111,21 +107,29 @@ class LinearRegression(override val uid: String) extends Estimator[LinearRegress
   override def copy(extra: ParamMap): Estimator[LinearRegressionModel] = defaultCopy(extra)
 
   override def transformSchema(schema: StructType): StructType = validateAndTransformSchema(schema)
+
+  override def write: MLWriter = new DefaultParamsWriter(this) {
+    override protected def saveImpl(path: String): Unit = {
+      super.saveImpl(path)
+      val vectors: (Vector, Vector, Vector) = (Vectors.dense(epsilon), Vectors.dense(maxIter), Vectors.dense(lr))
+      sqlContext.createDataFrame(Seq(vectors)).write.parquet(path + "/params")
+    }
+  }
+
 }
 
 /** Компаньон для эстиматора */
-object LinearRegression extends DefaultParamsReadable[LinearRegression] {
-  /** создание данных для тестирования модели */
-  def createTestData(spark: SparkSession, n: Int, a: breeze.linalg.DenseVector[Double], b: Double): DataFrame = {
-    import spark.implicits._
-
-    val normal01 = breeze.stats.distributions.Gaussian(0, 1)
-    val X = breeze.linalg.DenseMatrix.rand(n, a.length, normal01)
-
-    val y = X * a + b
-    val data = breeze.linalg.DenseMatrix.horzcat(X, y.asDenseMatrix.t)
-    val df: DataFrame = data(*, ::).iterator.map(x => Tuple2(Vectors.dense(x(0), x(1), x(2)), x(3))).toSeq.toDF("features", "y")
-    df
+object LinearRegression extends MLReadable[LinearRegression] {
+  override def read: MLReader[LinearRegression] = new MLReader[LinearRegression] {
+    override def load(path: String): LinearRegression = {
+      val metadata = DefaultParamsReader.loadMetadata(path, sc)
+      val vectors = sqlContext.read.parquet(path + "/params")
+      implicit val encoder: Encoder[Vector] = ExpressionEncoder()
+      val (eps: Vector, maxIter: Vector, lr: Vector) = vectors.select(vectors("_1").as[Vector], vectors("_2").as[Vector], vectors("_3").as[Vector]).first()
+      val estim = new LinearRegression(eps(0), maxIter(0).asInstanceOf[Int], lr(0))
+      metadata.getAndSetParams(estim)
+      estim
+    }
   }
 }
 
@@ -151,12 +155,16 @@ class LinearRegressionModel private[made](override val uid: String,
     dataset.withColumn($(outputCol), multUdf(dataset($(inputCol))))
   }
 
+  def calcOne(v: breeze.linalg.Vector[Double]): Double = {
+    (v dot a.asBreeze) + b
+  }
+
   override def transformSchema(schema: StructType): StructType = validateAndTransformSchema(schema)
 
   override def write: MLWriter = new DefaultParamsWriter(this) {
     override protected def saveImpl(path: String): Unit = {
       super.saveImpl(path)
-      val vectors = a.asInstanceOf[Vector] -> Vectors.dense(b)
+      val vectors: (Vector, Vector) = a.asInstanceOf[Vector] -> Vectors.dense(b)
       sqlContext.createDataFrame(Seq(vectors)).write.parquet(path + "/vectors")
     }
   }
