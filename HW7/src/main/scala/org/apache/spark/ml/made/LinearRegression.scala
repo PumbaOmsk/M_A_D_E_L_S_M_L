@@ -1,5 +1,8 @@
 package org.apache.spark.ml.made
 
+import breeze.linalg
+import breeze.linalg.DenseMatrix
+import breeze.linalg.DenseMatrix.canTranspose
 import breeze.stats.distributions.Gaussian
 import org.apache.log4j.Logger
 import org.apache.spark.ml.linalg.{DenseVector, Vector, VectorUDT, Vectors}
@@ -71,13 +74,15 @@ class LinearRegression(override val uid: String,
         val summary = vectors.rdd.mapPartitions((data: Iterator[Row]) => {
           val summarizer1 = new MultivariateOnlineSummarizer()
           val summarizer2 = new MultivariateOnlineSummarizer()
-          data.foreach(v => {
-            val vB: breeze.linalg.Vector[Double] = v.getAs[DenseVector](0).asBreeze
-            val y: Double = v.getAs[Double](1)
-            val calc = model.calcOne(vB)
-            val eps = calc - y
-            val grad = vB * eps
-            summarizer1.add(mllib.linalg.Vectors.dense(eps))
+          data.grouped(10000).foreach((batch: Seq[Row]) => {
+            val batchize: Double = batch.length
+            val m: breeze.linalg.DenseMatrix[Double] = DenseMatrix(batch.map(row => row.getAs[DenseVector](0).values).toList: _*)
+            val calc: linalg.Vector[Double] = model.calcMatrix(m)
+            val y: breeze.linalg.DenseVector[Double] = breeze.linalg.DenseVector(batch.map(row => row.getAs[Double](1)).toArray)
+            val eps: linalg.Vector[Double] = calc - y
+            val epsV = breeze.linalg.sum(eps) / batchize
+            val grad = m.t * eps / batchize
+            summarizer1.add(mllib.linalg.Vectors.dense(epsV))
             summarizer2.add(mllib.linalg.Vectors.fromBreeze(grad))
           })
           Iterator(Tuple2(summarizer1, summarizer2))
@@ -155,8 +160,9 @@ class LinearRegressionModel private[made](override val uid: String,
     dataset.withColumn($(outputCol), multUdf(dataset($(inputCol))))
   }
 
-  def calcOne(v: breeze.linalg.Vector[Double]): Double = {
-    (v dot a.asBreeze) + b
+  /** Для вычисления модели по breeze матрице */
+  def calcMatrix(m: breeze.linalg.Matrix[Double]): breeze.linalg.Vector[Double] = {
+    (m * a.asBreeze) + b
   }
 
   override def transformSchema(schema: StructType): StructType = validateAndTransformSchema(schema)

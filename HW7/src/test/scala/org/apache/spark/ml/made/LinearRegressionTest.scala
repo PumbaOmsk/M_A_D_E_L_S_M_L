@@ -44,6 +44,22 @@ class LinearRegressionTest extends AnyFlatSpec with should.Matchers with WithSpa
     validateModel(model, testData)
   }
 
+  "Model" should "calc eq with Breeze" in {
+    val model = new LinearRegressionModel(aV, bV)
+      .setInputCol("features")
+      .setOutputCol("features")
+
+    val m = DenseMatrix(
+    breeze.linalg.DenseVector[Double](1, 2, 3),
+    breeze.linalg.DenseVector[Double](2, 4, 6),
+    breeze.linalg.DenseVector[Double](3, 6, 9))
+
+    val vectors: Array[Double] = model.calcMatrix(m).toArray
+    vectors.length should be(testVectors.length)
+    vectors(0) should be(18.0 +- accuracy)
+    vectors(1) should be(32.0 +- accuracy)
+    vectors(2) should be(46.0 +- accuracy)
+  }
 
   "Estimator" should "solve eq" in {
     import LinearRegressionTest.sqlc.implicits._
